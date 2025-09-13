@@ -1,0 +1,453 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>3-D Volume Viewer (Colors, Contrast/Gamma, Snapshots)</title>
+
+  <!-- Plotly for WebGL volume rendering -->
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+
+  <!-- fflate: tiny ZIP library to read .npz (zip) files client-side -->
+  <script src="https://unpkg.com/fflate@0.8.2/umd/index.js"></script>
+
+  <style>
+    /* Minimal, neutral UI */
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; }
+    header { padding: 12px 16px; background: #111; color: #fff; }
+    main { padding: 12px 16px; }
+    #controls, #chan, #tone { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    #viewer { width: 100%; height: 58vh; }
+    #mips { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+    .box { background: #f7f7f7; padding: 8px; border-radius: 8px; }
+    input[type="file"]{ display:none; }
+    .btn { border: 0; background: #2563eb; color: white; padding: 8px 12px; border-radius: 8px; cursor: pointer; }
+    label { font-weight: 600; }
+    select, input[type="number"], input[type="color"] { padding: 6px; border-radius: 8px; }
+    .pill { background:#f0f0f0; padding:6px 10px; border-radius:999px; display:inline-block; }
+    img { width: 100%; height: auto; border-radius: 6px; }
+    .small { width:5rem; }
+    .tight { width:4.5rem; }
+  </style>
+</head>
+
+<body>
+<header>
+  <h2>3-D Volume Viewer</h2>
+  <div>
+    Load one or more NPZ files (r.npy, g.npy, b.npy, meta.json). Per-channel colors,
+    global contrast/gamma, client-side MIPs, and PNG snapshot.
+  </div>
+</header>
+
+<main>
+  <!-- Top bar controls -->
+  <div id="controls">
+    <label class="btn">
+      <input id="files" type="file" accept=".npz" multiple />
+      Load NPZ(s)
+    </label>
+
+    <label>Dataset <select id="dataset"></select></label>
+    <span id="meta" class="pill">No file loaded</span>
+
+    <!-- Number of isosurfaces per volume trace -->
+    <label>Isosurfaces
+      <input id="surface_count" type="number" value="10" class="small" />
+    </label>
+
+    <!-- Save current 3-D view as PNG -->
+    <button id="savepng" class="btn" disabled>Save PNG</button>
+  </div>
+
+  <!-- Per-channel controls (visibility, color, thresholds, opacity) -->
+  <div id="chan" class="box">
+    <div>
+      <input type="checkbox" id="toggle_r" checked />
+      <label for="toggle_r">Red (Ch3)</label>
+      <input id="color_r" type="color" value="#ff0000" title="Red color" />
+      Isomin <input id="isomin_r" type="number" step="0.01" value="0.20" class="tight" />
+      Opacity <input id="opacity_r" type="number" step="0.01" value="0.06" class="tight" />
+    </div>
+
+    <div>
+      <input type="checkbox" id="toggle_g" checked />
+      <label for="toggle_g">Green (Ch1)</label>
+      <input id="color_g" type="color" value="#00ff00" title="Green color" />
+      Isomin <input id="isomin_g" type="number" step="0.01" value="0.20" class="tight" />
+      Opacity <input id="opacity_g" type="number" step="0.01" value="0.06" class="tight" />
+    </div>
+
+    <div>
+      <input type="checkbox" id="toggle_b" checked />
+      <label for="toggle_b">Blue (Ch2)</label>
+      <input id="color_b" type="color" value="#0000ff" title="Blue color" />
+      Isomin <input id="isomin_b" type="number" step="0.01" value="0.20" class="tight" />
+      Opacity <input id="opacity_b" type="number" step="0.01" value="0.06" class="tight" />
+    </div>
+
+    <button id="rerender" class="btn" disabled>Re-render</button>
+  </div>
+
+  <!-- Global tone controls (apply to all channels uniformly) -->
+  <div id="tone" class="box">
+    <div>Contrast Lo
+      <input id="lo" type="number" step="0.01" value="0.00" class="tight" />
+    </div>
+    <div>Hi
+      <input id="hi" type="number" step="0.01" value="1.00" class="tight" />
+    </div>
+    <div>Gamma
+      <input id="gamma" type="number" step="0.05" value="1.00" class="tight" />
+    </div>
+    <small>(Applied to all channels: v′ = clip((v − Lo)/(Hi − Lo), 0..1)<sup>Gamma</sup>)</small>
+  </div>
+
+  <!-- Main 3-D WebGL plot -->
+  <div id="viewer" class="box"></div>
+
+  <!-- Orthogonal MIPs computed client-side from the tone-mapped data -->
+  <div id="mips">
+    <div class="box">
+      <div style="font-weight:600;margin-bottom:4px;">XY MIP</div>
+      <img id="mip_xy" alt="XY MIP" />
+    </div>
+    <div class="box">
+      <div style="font-weight:600;margin-bottom:4px;">XZ MIP</div>
+      <img id="mip_xz" alt="XZ MIP" />
+    </div>
+    <div class="box">
+      <div style="font-weight:600;margin-bottom:4px;">YZ MIP</div>
+      <img id="mip_yz" alt="YZ MIP" />
+    </div>
+  </div>
+</main>
+
+<script>
+/* -------------------------- Utility: parse NPY in-browser ---------------------- */
+
+function parseNPY(buffer) {
+  const u8 = new Uint8Array(buffer);
+  // Verify magic "\x93NUMPY"
+  if (!(u8[0] === 0x93 && u8[1]===0x4E && u8[2]===0x55 && u8[3]===0x4D && u8[4]===0x50 && u8[5]===0x59)) {
+    throw new Error("Not an NPY file");
+  }
+  const verMajor = u8[6], verMinor = u8[7];
+  let headerLen, headerStart;
+  if (verMajor === 1) {
+    headerLen = new DataView(buffer, 8, 2).getUint16(0, true);
+    headerStart = 10;
+  } else if (verMajor === 2) {
+    headerLen = new DataView(buffer, 8, 4).getUint32(0, true);
+    headerStart = 12;
+  } else {
+    throw new Error("Unsupported NPY version: " + verMajor + "." + verMinor);
+  }
+  const header = new TextDecoder().decode(new Uint8Array(buffer, headerStart, headerLen));
+  const descr = /'descr':\s*'([^']+)'/.exec(header)?.[1];
+  const shapeStr = /'shape':\s*\(([^)]+)\)/.exec(header)?.[1];
+  const fortran = /'fortran_order':\s*(True|False)/.exec(header)?.[1] === "True";
+  if (!descr || !shapeStr || fortran === undefined) throw new Error("Invalid NPY header");
+
+  const typeChar = descr.replace(/[<\|>]/g, '');
+  const littleEndian = descr.startsWith('<') || descr.startsWith('|');
+  if (!littleEndian) throw new Error("Big-endian arrays not supported");
+
+  const shape = shapeStr.split(',').map(s => s.trim()).filter(Boolean).map(s => parseInt(s));
+  const dataStart = headerStart + headerLen;
+
+  let arr;
+  if (typeChar === 'f4')      arr = new Float32Array(buffer, dataStart);
+  else if (typeChar === 'f8') arr = new Float64Array(buffer, dataStart);
+  else if (typeChar === 'u1') arr = new Uint8Array(buffer, dataStart);
+  else throw new Error("Unsupported dtype "+typeChar);
+
+  return { data: arr, shape };
+}
+
+function toBuffer(u8) {
+  // fflate returns Uint8Array views; preserve the slice being used
+  return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+}
+
+
+/* -------------------------- Dataset management -------------------------------- */
+
+let datasets = []; // array of {name, r:{data,shape}, g, b, meta}
+let current = -1;
+
+async function onFilesSelected(fileList) {
+  datasets = [];
+  current = -1;
+  const sel = document.getElementById('dataset');
+  sel.innerHTML = '';
+
+  for (const f of fileList) {
+    try {
+      const buf = new Uint8Array(await f.arrayBuffer());
+      const unzipped = fflate.unzipSync(buf);
+      const r = parseNPY(toBuffer(unzipped['r.npy']));
+      const g = parseNPY(toBuffer(unzipped['g.npy']));
+      const b = parseNPY(toBuffer(unzipped['b.npy']));
+      const meta = JSON.parse(new TextDecoder().decode(toBuffer(unzipped['meta.json'])));
+      datasets.push({name: f.name, r, g, b, meta});
+
+      const o = document.createElement('option');
+      o.value = String(datasets.length-1);
+      o.textContent = f.name;
+      sel.appendChild(o);
+
+    } catch (e) {
+      console.error("Failed to load", f.name, e);
+    }
+  }
+
+  if (datasets.length) {
+    current = 0;
+    sel.value = "0";
+    updateMeta();
+    render();
+    enableControls(true);
+  } else {
+    enableControls(false);
+  }
+}
+
+function enableControls(on) {
+  ['rerender','savepng','toggle_r','toggle_g','toggle_b','isomin_r','isomin_g','isomin_b',
+   'opacity_r','opacity_g','opacity_b','surface_count','color_r','color_g','color_b',
+   'lo','hi','gamma','dataset'].forEach(id=>{
+    document.getElementById(id).disabled = !on;
+  });
+}
+
+function updateMeta() {
+  const ds = datasets[current];
+  const m = ds.meta;
+  // Effective voxel spacing (µm) includes XY downsample factor used at conversion time
+  const effX = (m.vx_um * (m.ds||1)).toFixed(3);
+  const effY = (m.vy_um * (m.ds||1)).toFixed(3);
+  const effZ = (m.vz_um).toFixed(3);
+
+  document.getElementById('meta').textContent =
+    `Z×Y×X=${ds.r.shape.join('×')} | voxel µm (eff): X=${effX}, Y=${effY}, Z=${effZ} | ${m.file||datasets[current].name}`;
+}
+
+
+/* -------------------------- Geometry & tone mapping --------------------------- */
+
+function makeCoords(Z, Y, X, vx, vy, vz) {
+  // Build x/y/z arrays matched to value.flatten(order='C') on V[Z,Y,X]
+  const x = new Float32Array(X*Y*Z);
+  const y = new Float32Array(X*Y*Z);
+  const z = new Float32Array(X*Y*Z);
+  let idx = 0;
+  for (let k=0;k<Z;k++) for (let j=0;j<Y;j++) for (let i=0;i<X;i++) {
+    x[idx] = i*vx; y[idx] = j*vy; z[idx] = k*vz; idx++;
+  }
+  return {x, y, z};
+}
+
+function applyTone(src, lo, hi, gamma) {
+  // Global contrast/gamma remap to [0,1]
+  const n = src.length;
+  const out = new Float32Array(n);
+  const a = 1.0 / Math.max(1e-6, (hi - lo));
+  const g = Math.max(gamma, 1e-6);
+  for (let i=0;i<n;i++) {
+    let v = (src[i] - lo) * a;
+    if (v < 0) v = 0;
+    else if (v > 1) v = 1;
+    out[i] = Math.pow(v, g);
+  }
+  return out;
+}
+
+function hexToRgb(hex) {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  if (!m) return [255,255,255];
+  return [parseInt(m[1],16), parseInt(m[2],16), parseInt(m[3],16)];
+}
+
+function colorScaleFromHex(hex) {
+  const [r,g,b] = hexToRgb(hex);
+  return [[0,'rgb(0,0,0)'], [1,`rgb(${r},${g},${b})`]];
+}
+
+
+/* -------------------------- MIP generation (client-side) ---------------------- */
+
+function toImageData(rgb, w, h) {
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(w, h);
+  img.data.set(rgb);
+  ctx.putImageData(img, 0, 0);
+  return canvas.toDataURL();
+}
+
+function mipRGB(ds, lo, hi, gamma) {
+  // Tone-map first so MIPs match 3-D view intensity shaping
+  const Z=ds.r.shape[0], Y=ds.r.shape[1], X=ds.r.shape[2];
+  const r = applyTone(ds.r.data, lo, hi, gamma);
+  const g = applyTone(ds.g.data, lo, hi, gamma);
+  const b = applyTone(ds.b.data, lo, hi, gamma);
+
+  const xy = new Uint8ClampedArray(X*Y*4);
+  const xz = new Uint8ClampedArray(X*Z*4);
+  const yz = new Uint8ClampedArray(Y*Z*4);
+
+  // XY MIP: max over Z
+  for (let j=0;j<Y;j++) for (let i=0;i<X;i++) {
+    let rmax=0,gmax=0,bmax=0;
+    for (let k=0;k<Z;k++) {
+      const idx = k*Y*X + j*X + i;
+      rmax = Math.max(rmax, r[idx]*255);
+      gmax = Math.max(gmax, g[idx]*255);
+      bmax = Math.max(bmax, b[idx]*255);
+    }
+    const p = (j*X + i)*4;
+    xy[p]=rmax; xy[p+1]=gmax; xy[p+2]=bmax; xy[p+3]=255;
+  }
+
+  // XZ MIP: max over Y
+  for (let k=0;k<Z;k++) for (let i=0;i<X;i++) {
+    let rmax=0,gmax=0,bmax=0;
+    for (let j=0;j<Y;j++) {
+      const idx = k*Y*X + j*X + i;
+      rmax = Math.max(rmax, r[idx]*255);
+      gmax = Math.max(gmax, g[idx]*255);
+      bmax = Math.max(bmax, b[idx]*255);
+    }
+    const p = (k*X + i)*4;
+    xz[p]=rmax; xz[p+1]=gmax; xz[p+2]=bmax; xz[p+3]=255;
+  }
+
+  // YZ MIP: max over X
+  for (let k=0;k<Z;k++) for (let j=0;j<Y;j++) {
+    let rmax=0,gmax=0,bmax=0;
+    for (let i=0;i<X;i++) {
+      const idx = k*Y*X + j*X + i;
+      rmax = Math.max(rmax, r[idx]*255);
+      gmax = Math.max(gmax, g[idx]*255);
+      bmax = Math.max(bmax, b[idx]*255);
+    }
+    const p = (k*Y + j)*4;
+    yz[p]=rmax; yz[p+1]=gmax; yz[p+2]=bmax; yz[p+3]=255;
+  }
+
+  return {
+    xy: toImageData(xy, X, Y),
+    xz: toImageData(xz, X, Z),
+    yz: toImageData(yz, Y, Z)
+  };
+}
+
+
+/* -------------------------- Rendering ----------------------------------------- */
+
+function render() {
+  if (current < 0) return;
+
+  const ds = datasets[current];
+  const Z = ds.r.shape[0], Y = ds.r.shape[1], X = ds.r.shape[2];
+
+  // Effective voxel spacing (µm): apply XY downsample factor used at conversion
+  const m = ds.meta;
+  const vx_eff = m.vx_um * (m.ds || 1);
+  const vy_eff = m.vy_um * (m.ds || 1);
+  const vz_eff = m.vz_um;
+
+  const {x, y, z} = makeCoords(Z, Y, X, vx_eff, vy_eff, vz_eff);
+  const sc = parseInt(document.getElementById('surface_count').value, 10);
+
+  // Global tone mapping
+  const lo = parseFloat(document.getElementById('lo').value);     // recommended range 0.00–0.50
+  const hi = parseFloat(document.getElementById('hi').value);     // recommended range 0.50–1.00
+  const gamma = parseFloat(document.getElementById('gamma').value); // recommended range 0.50–3.00
+
+  const rVals = applyTone(ds.r.data, lo, hi, gamma);
+  const gVals = applyTone(ds.g.data, lo, hi, gamma);
+  const bVals = applyTone(ds.b.data, lo, hi, gamma);
+
+  const traces = [];
+  function addChannel(values, name, hex, isomin, opacity, on) {
+    if (!on) return;
+    traces.push({
+      type: 'volume',
+      x, y, z,
+      value: values,       // Float32Array in [0,1]
+      cmin: 0.0, cmax: 1.0,
+      isomin, isomax: 1.0, // 'isomin' slider controls threshold; 'isomax' capped at 1.0
+      opacity,             // alpha blending (typical 0.02–0.15 for stacks of this size)
+      surface_count: sc,   // # of isosurfaces (integer, useful range 5–30)
+      colorscale: colorScaleFromHex(hex),
+      showscale: false,
+      name
+    });
+  }
+
+  addChannel(rVals, 'Red (Ch3)',   document.getElementById('color_r').value,
+    parseFloat(document.getElementById('isomin_r').value), parseFloat(document.getElementById('opacity_r').value),
+    document.getElementById('toggle_r').checked);
+
+  addChannel(gVals, 'Green (Ch1)', document.getElementById('color_g').value,
+    parseFloat(document.getElementById('isomin_g').value), parseFloat(document.getElementById('opacity_g').value),
+    document.getElementById('toggle_g').checked);
+
+  addChannel(bVals, 'Blue (Ch2)',  document.getElementById('color_b').value,
+    parseFloat(document.getElementById('isomin_b').value), parseFloat(document.getElementById('opacity_b').value),
+    document.getElementById('toggle_b').checked);
+
+  const layout = {
+    title: `${m.file || datasets[current].name}`,
+    scene: {
+      xaxis: { title: 'X (µm)' },
+      yaxis: { title: 'Y (µm)' },
+      zaxis: { title: 'Z (µm)' },
+      aspectmode: 'data'   // respect physical units for geometry (no artificial equal scaling)
+    }
+  };
+
+  Plotly.newPlot('viewer', traces, layout, {responsive:true}).then(()=>{
+    document.getElementById('savepng').disabled = false;
+  });
+
+  // Update MIPs (same tone mapping as above)
+  const mips = mipRGB(datasets[current], lo, hi, gamma);
+  document.getElementById('mip_xy').src = mips.xy;
+  document.getElementById('mip_xz').src = mips.xz;
+  document.getElementById('mip_yz').src = mips.yz;
+}
+
+
+/* -------------------------- Snapshot ------------------------------------------ */
+
+function savePNG() {
+  const gd = document.getElementById('viewer').querySelector('.js-plotly-plot');
+  if (!gd) return;
+  Plotly.downloadImage(gd, {
+    format: 'png',
+    filename: 'volume_snapshot',
+    width: 1200,
+    height: 800
+  });
+}
+
+
+/* -------------------------- Wire up events ------------------------------------ */
+
+document.getElementById('files').addEventListener('change', (e)=>{ onFilesSelected(e.target.files); });
+document.getElementById('dataset').addEventListener('change', (e)=>{ current = parseInt(e.target.value, 10); updateMeta(); render(); });
+document.getElementById('rerender').addEventListener('click', render);
+document.getElementById('savepng').addEventListener('click', savePNG);
+
+// React to quick tweaks without hitting Re-render
+['toggle_r','toggle_g','toggle_b','color_r','color_g','color_b',
+ 'isomin_r','isomin_g','isomin_b','opacity_r','opacity_g','opacity_b',
+ 'surface_count','lo','hi','gamma'].forEach(id=>{
+  document.getElementById(id).addEventListener('change', render);
+});
+</script>
+</body>
+</html>
