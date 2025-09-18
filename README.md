@@ -1,5 +1,3 @@
-Sure! Below is a **single, comprehensive `README.md`** that you can drop straight into your GitHub repository.
-It documents both tools—**`lsm_to_npz.py`** and **`volume_viewer.html`**—and explains installation, usage, flags (with recommended ranges), and tips for both **high performance** and **high fidelity**.
 
 ---
 
